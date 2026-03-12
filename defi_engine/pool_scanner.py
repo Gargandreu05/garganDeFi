@@ -32,7 +32,6 @@ from defi_engine.math_engine import (
     PoolMetrics,
     pool_net_apy,
     is_migration_profitable,
-    compute_zap_amounts,
 )
 from ui.database import Database
 

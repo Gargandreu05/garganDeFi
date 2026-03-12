@@ -25,6 +25,7 @@ import structlog
 from ui.database import Database
 from defi_engine.pool_scanner import PoolScanner
 from crawlers.motor import DealsCrawler
+from config.system_monitor import SystemMonitor
 
 # ── Load .env ──────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -66,6 +67,35 @@ bot.state: dict = {}
 async def on_ready() -> None:
     log.info("discord_ready", user=str(bot.user), guilds=len(bot.guilds))
     await bot.tree.sync()   # Sync slash commands if any are added later
+    
+    # DEV-OPS STARTUP BROADCAST
+    monitor = bot.state.get("system_monitor")
+    if monitor:
+        metrics = await monitor.get_system_metrics()
+        
+        embed = discord.Embed(
+            title="🟢 GarganDeFi Core Online",
+            description="All modules loaded and background tracking active.",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="CPU Usage", value=f"`{metrics['cpu_percent']:.1f}%`", inline=True)
+        embed.add_field(name="CPU Temp", value=f"`{metrics['cpu_temp']:.1f}°C`", inline=True)
+        embed.add_field(name="RAM Usage", value=f"`{metrics['ram_used_gb']:.1f}GB / {metrics['ram_total_gb']:.1f}GB ({metrics['ram_percent']}%)`", inline=False)
+        embed.set_footer(text="DevOps & Hardware Monitor")
+        
+        # Send to DEALS channel
+        deals_id = int(os.getenv("DISCORD_DEALS_CHANNEL_ID", "0"))
+        if deals_id > 0:
+            c1 = bot.get_channel(deals_id)
+            if c1:
+                await c1.send(embed=embed)
+                
+        # Send to DEFI channel
+        defi_id = int(os.getenv("DISCORD_DEFI_ALERTS_CHANNEL_ID", "0"))
+        if defi_id > 0:
+            c2 = bot.get_channel(defi_id)
+            if c2:
+                await c2.send(embed=embed)
 
 
 @bot.event
@@ -109,11 +139,13 @@ async def main() -> None:
     # 2. Initialise shared services
     scanner = PoolScanner(db=db)
     crawler = DealsCrawler(db=db)
+    monitor = SystemMonitor(bot=bot)
 
     # Store on bot so Cogs can access via ctx.bot.state
     bot.state["db"] = db
     bot.state["pool_scanner"] = scanner
     bot.state["deals_crawler"] = crawler
+    bot.state["system_monitor"] = monitor
 
     # 3. Load Cogs
     await _load_cogs()
@@ -159,6 +191,8 @@ async def main() -> None:
 
         # Close DB
         await db.close()
+        # Ensure monitor loops are closed
+        monitor.stop()
         log.info("shutdown_complete")
 
 

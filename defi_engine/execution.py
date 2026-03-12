@@ -21,7 +21,6 @@ from typing import Optional
 import aiohttp
 import structlog
 from solana.rpc.async_api import AsyncClient
-from solana.rpc.commitment import Confirmed
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.instruction import Instruction, AccountMeta
@@ -35,7 +34,6 @@ from tenacity import (
     retry_if_exception_type,
 )
 
-from defi_engine.math_engine import LAMPORTS_PER_SOL
 
 log = structlog.get_logger(__name__)
 
@@ -317,8 +315,12 @@ class RaydiumExecutor:
         Order matches the Raydium AMM v4 IDL.
         """
         kp = self._keypair
-        is_signer_writable = lambda k: AccountMeta(pubkey=Pubkey.from_string(k), is_signer=False, is_writable=True)
-        is_readonly = lambda k: AccountMeta(pubkey=Pubkey.from_string(k), is_signer=False, is_writable=False)
+
+        def is_signer_writable(k):
+            return AccountMeta(pubkey=Pubkey.from_string(k), is_signer=False, is_writable=True)
+
+        def is_readonly(k):
+            return AccountMeta(pubkey=Pubkey.from_string(k), is_signer=False, is_writable=False)
 
         return [
             AccountMeta(pubkey=TOKEN_PROGRAM_ID,      is_signer=False, is_writable=False),
@@ -338,8 +340,12 @@ class RaydiumExecutor:
 
     def _build_remove_liquidity_keys(self, p: dict) -> list[AccountMeta]:
         kp = self._keypair
-        is_signer_writable = lambda k: AccountMeta(pubkey=Pubkey.from_string(k), is_signer=False, is_writable=True)
-        is_readonly = lambda k: AccountMeta(pubkey=Pubkey.from_string(k), is_signer=False, is_writable=False)
+        
+        def is_signer_writable(k):
+            return AccountMeta(pubkey=Pubkey.from_string(k), is_signer=False, is_writable=True)
+
+        def is_readonly(k):
+            return AccountMeta(pubkey=Pubkey.from_string(k), is_signer=False, is_writable=False)
 
         return [
             AccountMeta(pubkey=TOKEN_PROGRAM_ID,      is_signer=False, is_writable=False),

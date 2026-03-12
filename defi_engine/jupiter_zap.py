@@ -20,9 +20,7 @@ from typing import Optional
 import aiohttp
 import structlog
 from solana.rpc.async_api import AsyncClient
-from solana.rpc.commitment import Confirmed
 from solders.keypair import Keypair
-from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 from tenacity import (
     AsyncRetrying,

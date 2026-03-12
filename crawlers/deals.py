@@ -22,7 +22,15 @@ log = structlog.get_logger(__name__)
 def _load_keywords() -> list[str]:
     raw = os.getenv(
         "DEALS_KEYWORDS",
-        "GPU,RTX,RX 7900,RX 6800,Arc B580,mini-PC,NUC,Ryzen,Core Ultra",
+        "GPU,RTX,RX 7900,RX 6800,Arc B580,mini-PC,NUC,Ryzen,Core Ultra,OLED,SSD",
+    )
+    return [kw.strip().lower() for kw in raw.split(",") if kw.strip()]
+
+
+def _load_banned_keywords() -> list[str]:
+    raw = os.getenv(
+        "DEALS_BANNED_KEYWORDS",
+        "refurbished,used,open box,parts only,broken,finance,monthly,sweepstakes,giveaway",
     )
     return [kw.strip().lower() for kw in raw.split(",") if kw.strip()]
 
@@ -42,10 +50,15 @@ class Deal:
     discount_pct: Optional[float] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        if self.price and self.original_price and self.original_price > 0:
-            self.discount_pct = (
-                (self.original_price - self.price) / self.original_price
-            ) * 100.0
+        if self.price is not None and self.original_price is not None:
+            if self.original_price > self.price and self.price > 0:
+                self.discount_pct = (
+                    (self.original_price - self.price) / self.original_price
+                ) * 100.0
+            else:
+                self.discount_pct = 0.0
+        else:
+            self.discount_pct = None
 
     def to_dict(self) -> dict:
         return {
@@ -74,16 +87,23 @@ class DealFilter:
 
     def __init__(self) -> None:
         self._keywords = _load_keywords()
+        self._banned_keywords = _load_banned_keywords()
         self._min_discount = _load_min_discount()
 
     def reload(self) -> None:
         """Re-read .env settings so changes take effect without restart."""
         self._keywords = _load_keywords()
+        self._banned_keywords = _load_banned_keywords()
         self._min_discount = _load_min_discount()
 
     def is_relevant(self, deal: Deal) -> bool:
-        """Return True if the deal matches at least one keyword AND meets discount threshold."""
+        """Return True if the deal matches at least one keyword, no banned words, AND meets discount threshold."""
         title_lower = deal.title.lower()
+
+        for banned in self._banned_keywords:
+            if banned in title_lower:
+                log.debug("deal_filtered_banned", title=deal.title[:60], banned=banned)
+                return False
 
         keyword_match = any(kw in title_lower for kw in self._keywords)
         if not keyword_match:
@@ -108,15 +128,50 @@ class DealFilter:
 # ── Parsers ───────────────────────────────────────────────────────────────────
 
 def _parse_price(text: str) -> Optional[float]:
-    """Extract the first number with optional decimal from a price string."""
+    """Intelligently extract the numeric price from a string, ignoring noise."""
+    if text is None:
+        return None
+    text = str(text).strip()
     if not text:
         return None
-    match = re.search(r"[\$€£]?\s*([\d,]+(?:\.\d{1,2})?)", text.replace(",", ""))
+
+    # Fast path: if the text is exactly a number (e.g., from an API JSON)
+    try:
+        val = float(text.replace(",", ""))
+        return val if val > 0 else None
+    except ValueError:
+        pass
+
+    text_clean = text.replace(",", "")
+    
+    # Priority 1: Has a currency symbol ($499.00 or €30)
+    match = re.search(r"[\$€£]\s*(\d+(?:\.\d{1,2})?)", text_clean)
     if match:
         try:
-            return float(match.group(1))
+            val = float(match.group(1))
+            return val if val > 0 else None
         except ValueError:
-            return None
+            pass
+            
+    # Priority 2: Word USD, EUR etc (499.99 USD)
+    match_usd = re.search(r"(\d+(?:\.\d{1,2})?)\s*(?:USD|EUR|GBP)", text_clean, re.IGNORECASE)
+    if match_usd:
+        try:
+            val = float(match_usd.group(1))
+            return val if val > 0 else None
+        except ValueError:
+            pass
+
+    # Priority 3: Fallback straight number extraction (Risky: might snag "32" from "32gb")
+    # Only returning it if no currency symbol but still distinctly formatted with decimal
+    match_decimal = re.search(r"(\d+\.\d{2})", text_clean)
+    if match_decimal:
+        try:
+            val = float(match_decimal.group(1))
+            return val if val > 0 else None
+        except ValueError:
+            pass
+
     return None
 
 
@@ -149,8 +204,25 @@ def parse_reddit_item(item: dict) -> Optional[Deal]:
         url = data.get("url") or f"https://reddit.com{data.get('permalink', '')}"
         # Try to extract price from title: [GPU] ASUS RTX 3080 - $499
         price_match = re.search(r"\$\s*([\d,]+(?:\.\d{1,2})?)", title)
-        price = float(price_match.group(1).replace(",", "")) if price_match else None
-        return Deal(title=title, price=price, original_price=None, url=url, source="Reddit")
+        price = None
+        if price_match:
+            try:
+                price = float(price_match.group(1).replace(",", ""))
+            except ValueError:
+                pass
+                
+        # Smartly find old price from strikethrough (markdown ~~$500~~) or "was $500"
+        original = None
+        old_price_match = re.search(r"(?:~~\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*~~|was\s*\$?\s*([\d,]+(?:\.\d{1,2})?))", title, re.IGNORECASE)
+        if old_price_match:
+            raw_old = old_price_match.group(1) or old_price_match.group(2)
+            if raw_old:
+                try:
+                    original = float(raw_old.replace(",", ""))
+                except ValueError:
+                    pass
+
+        return Deal(title=title, price=price, original_price=original, url=url, source="Reddit")
     except Exception as exc:
         log.warning("parse_reddit_failed", error=str(exc))
         return None

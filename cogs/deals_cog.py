@@ -11,7 +11,6 @@ Connects the DealsCrawler to Discord. Responsibilities:
 from __future__ import annotations
 
 import os
-from typing import Optional
 
 import discord
 from discord.ext import commands

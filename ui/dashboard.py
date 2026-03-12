@@ -15,7 +15,6 @@ Reads directly from the SQLite database (read-only) and displays:
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -72,7 +71,7 @@ with st.sidebar:
     st.title("GarganDeFi")
     st.caption("Solana DeFi + Hardware Deals Bot")
     st.divider()
-    st.write(f"**Active Pool ID:**")
+    st.write("**Active Pool ID:**")
     active_pool = os.getenv("ACTIVE_POOL_ID", "Not set")
     st.code(active_pool, language=None)
     st.write(f"**HITL Mode:** {'ON' if os.getenv('AUTONOMOUS_POOL_SWITCHING','false').lower()!='true' else 'OFF (Auto)'}")

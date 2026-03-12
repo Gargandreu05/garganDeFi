@@ -21,10 +21,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Optional
 
+import aiohttp
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import set_key, find_dotenv
 
 import structlog
@@ -33,10 +33,21 @@ from defi_engine.pool_scanner import PoolScanner
 from defi_engine.jupiter_zap import JupiterZap
 from defi_engine.execution import RaydiumExecutor
 from defi_engine.math_engine import compute_zap_amounts, LAMPORTS_PER_SOL
+from defi_engine.quant_engine import QuantEngine
 from ui.database import Database
+from ui.graph_maker import GraphMaker
 from solana.rpc.async_api import AsyncClient
 
 log = structlog.get_logger(__name__)
+
+# Attempt to load the C++ optimized math engine, fallback to Python version if unavailable
+try:
+    import core_math
+    C_MATH_AVAILABLE = True
+    log.info("core_math C++ module loaded successfully.")
+except ImportError:
+    C_MATH_AVAILABLE = False
+    log.warning("core_math C++ module unavailable. Falling back to Python math engine.")
 
 
 def _rpc_client() -> AsyncClient:
@@ -53,7 +64,7 @@ class _MigrationView(discord.ui.View):
         self._candidate = candidate
         self._decided = False
 
-    @discord.ui.button(label="✅ Approve Migration", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, _btn: discord.ui.Button) -> None:
         owner_id = int(os.getenv("DISCORD_OWNER_ID", "0"))
         if interaction.user.id != owner_id:
@@ -67,11 +78,11 @@ class _MigrationView(discord.ui.View):
         await interaction.response.defer()
         await self._cog._execute_migration(self._candidate, interaction.channel)
 
-    @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Dismiss", style=discord.ButtonStyle.secondary)
     async def reject(self, interaction: discord.Interaction, _btn: discord.ui.Button) -> None:
         owner_id = int(os.getenv("DISCORD_OWNER_ID", "0"))
         if interaction.user.id != owner_id:
-            await interaction.response.send_message("⛔ Only the owner can reject.", ephemeral=True)
+            await interaction.response.send_message("⛔ Only the owner can dismiss.", ephemeral=True)
             return
         if self._decided:
             await interaction.response.send_message("⚠️ Already decided.", ephemeral=True)
@@ -81,16 +92,158 @@ class _MigrationView(discord.ui.View):
         scanner: PoolScanner = self._cog.bot.state.get("pool_scanner")
         if scanner:
             scanner.clear_pending_migration()
-        await interaction.response.send_message("✅ Migration rejected. Staying in current pool.")
+        await interaction.response.send_message("✅ Migration dismissed. Staying in current pool.")
 
+class _TradeIdeaView(discord.ui.View):
+    """Interactive buttons for Quant trade approvals."""
+
+    def __init__(self, cog: "DeFiCog", alert: dict, timeout: float = 3600) -> None:
+        super().__init__(timeout=timeout)
+        self._cog = cog
+        self._alert = alert
+        self._decided = False
+
+    @discord.ui.button(label="Approve Trade", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, _btn: discord.ui.Button) -> None:
+        owner_id = int(os.getenv("DISCORD_OWNER_ID", "0"))
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message("⛔ Only the owner can approve trades.", ephemeral=True)
+            return
+        if self._decided:
+            await interaction.response.send_message("⚠️ Already decided.", ephemeral=True)
+            return
+        self._decided = True
+        self.stop()
+        await interaction.response.defer()
+        await interaction.followup.send(f"✅ Trade approved for {self._alert['ticker']}. (Execution logic pending)")
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.secondary)
+    async def decline(self, interaction: discord.Interaction, _btn: discord.ui.Button) -> None:
+        owner_id = int(os.getenv("DISCORD_OWNER_ID", "0"))
+        if interaction.user.id != owner_id:
+            await interaction.response.send_message("⛔ Only the owner can decline trades.", ephemeral=True)
+            return
+        if self._decided:
+            await interaction.response.send_message("⚠️ Already decided.", ephemeral=True)
+            return
+        self._decided = True
+        self.stop()
+        await interaction.response.send_message(f"❌ Trade for {self._alert['ticker']} declined.")
 
 class DeFiCog(commands.Cog, name="DeFi Engine"):
     """Discord Cog for the DeFi HITL trading engine."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self._defi_channel_id = int(os.getenv("DISCORD_DEFI_ALERTS_CHANNEL_ID", "0"))
+        # Multi-channel priority routing
+        self._private_defi_channel_id = int(os.getenv("DISCORD_PRIVATE_DEFI_CHANNEL_ID", "0"))
+        
+        self._quant_engine = QuantEngine()
+        self._graph_maker = GraphMaker()
         self._owner_id = int(os.getenv("DISCORD_OWNER_ID", "0"))
+        self._top_tier_discovery.start()
+        self._quant_screener.start()
+
+    def cog_unload(self):
+        self._top_tier_discovery.cancel()
+        self._quant_screener.cancel()
+
+    @tasks.loop(minutes=5)
+    async def _top_tier_discovery(self) -> None:
+        """Top-Tier Discovery logic: Query Raydium’s API for top 5 volume SOL pools."""
+        try:
+            active_pool_id = os.getenv("ACTIVE_POOL_ID")
+            if not active_pool_id:
+                return
+
+            api_url = "https://api.raydium.io/v2/main/pool"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, timeout=15) as resp:
+                    if resp.status != 200:
+                        return
+                    data = await resp.json()
+
+            sol_pools = [p for p in data if p.get("baseMint") == "So11111111111111111111111111111111111111112" or p.get("quoteMint") == "So11111111111111111111111111111111111111112"]
+            sol_pools.sort(key=lambda x: x.get("volume24h", 0), reverse=True)
+            top_pools = sol_pools[:5]
+            if not top_pools:
+                return
+
+            top_pair = top_pools[0]
+            top_apy = top_pair.get("apr30d", 0) or top_pair.get("apr7d", 0) or top_pair.get("apr", 0) or 0
+            
+            active_pool = next((p for p in data if p.get("ammId") == active_pool_id), None)
+            active_apy = 0
+            if active_pool:
+                active_apy = active_pool.get("apr30d", 0) or active_pool.get("apr7d", 0) or active_pool.get("apr", 0) or 0
+
+            # Trigger condition: active drops 15% below top
+            # Leverage C++ math engine if available for these heavy comparisons
+            if C_MATH_AVAILABLE:
+                diff = core_math.calculate_apy_differential(top_apy, active_apy)
+            else:
+                diff = top_apy - active_apy
+
+            if active_apy < top_apy * 0.85:
+                candidate = {
+                    "pool_id": top_pair.get("ammId"),
+                    "name": top_pair.get("name", "Unknown Pool"),
+                    "base": top_pair.get("baseMint"),
+                    "quote": top_pair.get("quoteMint"),
+                    "net_apy": top_apy,
+                    "il_pct": 0.0
+                }
+                current = {
+                    "pool_id": active_pool_id,
+                    "name": active_pool.get("name", "Active Pool") if active_pool else "Active Pool",
+                    "net_apy": active_apy,
+                    "il_pct": 0.0
+                }
+                # Ensure we don't spam if a migration alert is pending
+                scanner: PoolScanner = self.bot.state.get("pool_scanner")
+                if scanner:
+                    pending = scanner.get_pending_migration()
+                    if pending and pending.get("pool_id") == candidate["pool_id"]:
+                        return
+                
+                await self._send_migration_alert(
+                    current=current, candidate=candidate, 
+                    reason=f"Active APY ({active_apy:.2f}%) dropped 15%+ below Top Tier APY ({top_apy:.2f}%). Diff: {diff:.2f}%"
+                )
+        except Exception as exc:
+            log.error("top_tier_discovery_failed", error=str(exc))
+
+    @_top_tier_discovery.before_loop
+    async def before_discovery(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=15)
+    async def _quant_screener(self) -> None:
+        """Quant Engine Screener logic: Fetch multi-asset indicators and score them."""
+        try:
+            alerts = await self._quant_engine.run_screener()
+            if not alerts:
+                return
+
+            from services.broadcaster import send_teaser_signal, send_vip_signal
+
+            for alert in alerts:
+                # 1. Broadcast Freemium Teaser
+                await send_teaser_signal(self.bot, alert)
+                
+                # 2. Broadcast Actionable Signal to VIP (and Owner can approve via View if crypto)
+                view = None
+                if alert['asset_type'] == "CRYPTO":
+                    view = _TradeIdeaView(cog=self, alert=alert)
+                
+                await send_vip_signal(self.bot, alert, view=view)
+
+        except Exception as exc:
+            log.error("quant_screener_failed", error=str(exc))
+
+    @_quant_screener.before_loop
+    async def before_quant_screener(self):
+        await self.bot.wait_until_ready()
 
     # ── Cog setup ─────────────────────────────────────────────────────────────
 
@@ -106,12 +259,59 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
     # ── Owner guard ───────────────────────────────────────────────────────────
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        """All DeFi commands require the bot owner unless overridden per-command."""
-        return True  # Per-command checks below
+        """All DeFi commands require the bot owner. Strict Private Wealth Manager boundary."""
+        if not self._is_owner(ctx.author):
+            await ctx.send("⛔ Only the owner can execute financial commands.")
+            return False
+        return True
 
     def _is_owner(self, ctx_or_user) -> bool:
         uid = ctx_or_user.id if hasattr(ctx_or_user, "id") else ctx_or_user
         return uid == self._owner_id
+
+    # ── !report ───────────────────────────────────────────────────────────────
+    
+    @commands.command(name="report")
+    async def report(self, ctx: commands.Context) -> None:
+        """Generate a visual portfolio report (Owner only)."""
+        if not self._is_owner(ctx.author):
+            await ctx.send("⛔ Only the bot owner can fetch proprietary visual reports.")
+            return
+            
+        async with ctx.typing():
+            db: Database = self.bot.state.get("db")
+            if not db:
+                await ctx.send("❌ Database not connected.")
+                return
+
+            # Fetch 24h profit metrics
+            net_profit = await db.get_net_profit_sol()
+            
+            # Generate the hacker-themed chart
+            chart_buffer = await self._graph_maker.generate_portfolio_chart(db)
+            
+            if chart_buffer is None:
+                await ctx.send("❌ Not enough data to generate visual report.")
+                return
+                
+            # Create a discord file object to be uploaded as attachment
+            file = discord.File(fp=chart_buffer, filename="portfolio_chart.png")
+
+            # Build Embed
+            embed = discord.Embed(
+                title="📊 Executive Portfolio Report",
+                description="Visual performance analysis powered by GarganDeFi Quant Engine.",
+                color=0x00ffcc # Neon Cyan to match chart primary color
+            )
+            embed.add_field(name="Network", value="`Solana Mainnet-Beta`", inline=True)
+            embed.add_field(name="Active Strategies", value="`Raydium LP` / `Quant Screen`", inline=True)
+            embed.add_field(name="Net Profit (All Time)", value=f"`{net_profit:+.4f} SOL`", inline=False)
+            
+            # Embed the generated file as an image inside the Embed
+            embed.set_image(url="attachment://portfolio_chart.png")
+            embed.set_footer(text="Confidential Hacker Analytics — Restricted Access")
+
+            await ctx.send(embed=embed, file=file)
 
     # ── !defi_status ──────────────────────────────────────────────────────────
 
@@ -314,7 +514,7 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
             await asyncio.sleep(5)
 
             # ── Step 2: Jupiter Zap ────────────────────────────────────────
-            await channel.send(f"**[2/4]** 🔀 Swapping 50% SOL → Quote Token via Jupiter…")
+            await channel.send("**[2/4]** 🔀 Swapping 50% SOL → Quote Token via Jupiter…")
             zap_result = None
             swap_trade_id = None
             try:
@@ -443,31 +643,65 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
         reason: str,
     ) -> None:
         """Called by PoolScanner when a better pool is identified (HITL mode)."""
-        channel = self.bot.get_channel(self._defi_channel_id)
+        channel = self.bot.get_channel(self._private_defi_channel_id)
         if channel is None:
-            log.warning("defi_alerts_channel_not_found", channel_id=self._defi_channel_id)
+            log.warning("private_defi_channel_not_found", channel_id=self._private_defi_channel_id)
             return
+
+        rpc = _rpc_client()
+        expected_slippage = "0.5%"
+        price_impact = "Simulation Failed"
+        gas_fee = "0.00 SOL"
+        net_gain = f"+{candidate['net_apy'] - current['net_apy']:.2f}% APY"
+        
+        try:
+            async with JupiterZap(rpc) as zap:
+                total_sol = await zap.get_wallet_sol_balance()
+                amounts = compute_zap_amounts(total_sol, gas_reserve_sol=0.02)
+                if amounts["sol_to_swap"] > 0:
+                    swap_lamports = int(amounts["sol_to_swap"] * LAMPORTS_PER_SOL)
+                    target_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # default usdc
+                    if candidate.get("base") and candidate.get("base") != "So11111111111111111111111111111111111111112":
+                        target_mint = candidate["base"]
+                    elif candidate.get("quote") and candidate.get("quote") != "So11111111111111111111111111111111111111112":
+                        target_mint = candidate["quote"]
+
+                    url = "https://quote-api.jup.ag/v6/quote"
+                    params = {
+                        "inputMint": "So11111111111111111111111111111111111111112",
+                        "outputMint": target_mint,
+                        "amount": str(swap_lamports),
+                        "slippageBps": "50"
+                    }
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params) as resp:
+                            if resp.status == 200:
+                                quote_data = await resp.json()
+                                p_impact = quote_data.get("priceImpactPct", 0)
+                                price_impact = f"{float(p_impact) * 100:.3f}%"
+                                expected_slippage = "0.5%"
+                                route = quote_data.get("routePlan", [])
+                                if route:
+                                    f_amt = route[0].get("swapInfo", {}).get("feeAmount", "0")
+                                    gas_fee = f"{int(f_amt) / LAMPORTS_PER_SOL:.6f} SOL"
+        except Exception as exc:
+            log.error("simulation_failed", error=str(exc))
+        finally:
+            await rpc.close()
 
         owner_mention = f"<@{self._owner_id}>" if self._owner_id else "Owner"
         embed = discord.Embed(
             title="🔔 Pool Migration Proposal",
-            description=(
-                f"{owner_mention} — the scanner found a better pool!\n\n"
-                f"**Reason:** {reason}"
-            ),
-            color=discord.Color.gold(),
+            description=f"{owner_mention} — a better pool has been discovered!\n\n**Reason:** {reason}",
+            color=discord.Color.red() if "alert" in reason.lower() else discord.Color.blue(),
         )
-        embed.add_field(
-            name="📍 Current Pool",
-            value=f"**{current['name']}**\nNet APY: `{current['net_apy']:.2f}%` | IL: `{current['il_pct']:.2f}%`",
-            inline=True,
-        )
-        embed.add_field(
-            name="✨ Candidate Pool",
-            value=f"**{candidate['name']}**\nNet APY: `{candidate['net_apy']:.2f}%` | IL: `{candidate['il_pct']:.2f}%`",
-            inline=True,
-        )
-        embed.set_footer(text="Click ✅ to migrate or ❌ to stay. This alert expires in 1 hour.")
+        embed.add_field(name="Current APY", value=f"`{current['net_apy']:.2f}%`", inline=True)
+        embed.add_field(name="Target APY", value=f"`{candidate['net_apy']:.2f}%`", inline=True)
+        embed.add_field(name="Net Gain", value=f"`{net_gain}`", inline=True)
+        embed.add_field(name="Expected Slippage", value=f"`{expected_slippage}`", inline=True)
+        embed.add_field(name="Price Impact (Jupiter)", value=f"`{price_impact}`", inline=True)
+        embed.add_field(name="Estimated Gas Fee", value=f"`{gas_fee}`", inline=True)
+        embed.set_footer(text="GarganDeFi | Click Approve to migrate")
 
         view = _MigrationView(cog=self, candidate=candidate)
 
@@ -487,7 +721,7 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
     async def _auto_migrate(self, candidate: dict) -> None:
         """Called by scanner when AUTONOMOUS_POOL_SWITCHING=true. NOT the default."""
         log.warning("autonomous_migration_executing", pool=candidate["name"])
-        channel = self.bot.get_channel(self._defi_channel_id)
+        channel = self.bot.get_channel(self._private_defi_channel_id)
         if channel:
             await channel.send(
                 f"🤖 **AUTONOMOUS MODE**: Auto-migrating to **{candidate['name']}**…"
