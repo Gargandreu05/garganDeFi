@@ -10,6 +10,7 @@ import asyncio
 import aiohttp
 import yfinance as yf
 import pandas as pd
+import pandas_ta as ta
 import structlog
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -156,18 +157,12 @@ class QuantEngine:
         return await self._apply_bayesian_confluence(tech_data, ticker)
 
 
-    async def analyze_crypto(self, pair_address: str) -> Optional[Dict[str, Any]]:
+    async def analyze_crypto(self, pair_address: str, relaxed: bool = False) -> Optional[Dict[str, Any]]:
         """
         Analyze a Solana token pair (or major crypto).
-        Since DexScreener's public free API doesn't give historical candles easily,
-        we'll use Jupiter API or just standard metrics if possible.
-        For robust TA, we need candles. Let's use yfinance for SOL-USD as a proxy 
-        if we just want SOL, or Jupiter 24h stats if we just need basic stats.
-        Since the prompt asks for strict mathematical indicators (pandas_ta), 
-        we NEED OHLCV data. I will use Binance API or another free API for Crypto OHLCV
-        for demonstration of strict TA on Crypto, or simply use yfinance 'SOL-USD'.
+        Relaxed mode lowers thresholds for high-liquidity pools.
         """
-        log.info("quant_analyzing_crypto", pair=pair_address)
+        log.info("quant_analyzing_crypto", pair=pair_address, relaxed=relaxed)
         
         # We will use yfinance for SOL-USD and others to ensure we have standard DAILY OHLCV 
         # for robust pandas_ta calculations without API keys.
@@ -204,13 +199,13 @@ class QuantEngine:
             tech_data['target_price'] = tech_data['current_price'] * 1.05
             tech_data['stop_loss'] = tech_data['current_price'] * 0.95
             
-        return await self._apply_bayesian_confluence(tech_data, token_name)
+        return await self._apply_bayesian_confluence(tech_data, token_name, relaxed=relaxed)
 
-    async def _apply_bayesian_confluence(self, tech_data: Dict[str, Any], keyword: str) -> Optional[Dict[str, Any]]:
+    async def _apply_bayesian_confluence(self, tech_data: Dict[str, Any], keyword: str, relaxed: bool = False) -> Optional[Dict[str, Any]]:
         """
         Applies Bayesian Probability Model and Confluence Rule.
         Weighted Model: 60% Tech, 40% Sentiment.
-        Confluence Rule: Alert only if both metrics align (Both > 0).
+        Relaxed mode (for blue-chips) lowers the entry barrier.
         """
         # Fetch News and score Sentiment
         headlines = await self._fetch_latest_news(tech_data['asset_type'])
@@ -219,11 +214,13 @@ class QuantEngine:
         tech_score = tech_data.get("tech_scaled_score", 0.0)
         
         # The 'Confluence' Rule: Both must be positive for a Bullish setup.
-        # If we had bearish (short) setups, both would need to be negative.
-        # But for this bot, we are doing Bullish screening.
-        if tech_score < 0.2 or sentiment_score < 0.1:
+        # Relaxed thresholds for "Blue-Chip" assets (TVL > $1M)
+        tech_min = 0.1 if relaxed else 0.2
+        sentiment_min = 0.05 if relaxed else 0.1
+
+        if tech_score < tech_min or sentiment_score < sentiment_min:
             log.info("quant_confluence_rejected", ticker=tech_data['ticker'], 
-                     tech=tech_score, sentiment=sentiment_score)
+                     tech=tech_score, sentiment=sentiment_score, relaxed=relaxed)
             # Fails confluence rule, don't generate alert
             return None
             

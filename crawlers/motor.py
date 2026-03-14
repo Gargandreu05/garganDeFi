@@ -36,20 +36,33 @@ from crawlers.deals import (
 )
 from ui.database import Database
 
+from fake_useragent import UserAgent
+
 log = structlog.get_logger(__name__)
+
+ua = UserAgent()
+
+def get_headers():
+    return {
+        "User-Agent": ua.random,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    }
+
 
 # ── Source URLs ───────────────────────────────────────────────────────────────
 SLICKDEALS_RSS = "https://slickdeals.net/newsearch.php?src=SearchBarV2&q=gpu&searcharea=deals&searchin=first_word&rss=1"
 REDDIT_HOT    = "https://www.reddit.com/r/buildapcsales/hot.json?limit=25"
 TECHBARGAINS  = "https://www.techbargains.com/deals/computers"
-
-_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
 
 
 class DealsCrawler:
@@ -71,7 +84,6 @@ class DealsCrawler:
     async def run_forever(self) -> None:
         """Main loop — scrapes all sources then sleeps."""
         self._session = aiohttp.ClientSession(
-            headers=_BROWSER_HEADERS,
             timeout=aiohttp.ClientTimeout(total=45),
         )
         log.info("deals_crawler_started", interval_s=self._interval)
@@ -218,7 +230,7 @@ class DealsCrawler:
                 reraise=True,
             ):
                 with attempt:
-                    async with self._session.get(url) as resp:
+                    async with self._session.get(url, headers=get_headers()) as resp:
                         resp.raise_for_status()
                         return await resp.text()
         except Exception as exc:
@@ -234,7 +246,7 @@ class DealsCrawler:
                 reraise=True,
             ):
                 with attempt:
-                    async with self._session.get(url) as resp:
+                    async with self._session.get(url, headers=get_headers()) as resp:
                         resp.raise_for_status()
                         return await resp.json()
         except Exception as exc:

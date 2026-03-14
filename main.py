@@ -116,7 +116,7 @@ async def on_command_error(ctx: commands.Context, error: Exception) -> None:
 
 async def _load_cogs() -> None:
     cog_modules = [
-        "cogs.deals_cog",
+        # "cogs.deals_cog",
         "cogs.defi_cog",
     ]
     for module in cog_modules:
@@ -138,13 +138,13 @@ async def main() -> None:
 
     # 2. Initialise shared services
     scanner = PoolScanner(db=db)
-    crawler = DealsCrawler(db=db)
+    # crawler = DealsCrawler(db=db)
     monitor = SystemMonitor(bot=bot)
 
     # Store on bot so Cogs can access via ctx.bot.state
     bot.state["db"] = db
     bot.state["pool_scanner"] = scanner
-    bot.state["deals_crawler"] = crawler
+    # bot.state["deals_crawler"] = crawler
     bot.state["system_monitor"] = monitor
 
     # 3. Load Cogs
@@ -170,7 +170,7 @@ async def main() -> None:
     async with bot:
         background_tasks = [
             asyncio.create_task(scanner.run_forever(), name="pool_scanner"),
-            asyncio.create_task(crawler.run_forever(), name="deals_crawler"),
+            # asyncio.create_task(crawler.run_forever(), name="deals_crawler"),
             asyncio.create_task(bot.start(token), name="discord_bot"),
             asyncio.create_task(shutdown_event.wait(), name="shutdown_watcher"),
         ]

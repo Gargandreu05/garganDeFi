@@ -174,6 +174,19 @@ class Database:
             (pool_id, limit),
         )
 
+    async def clear_all_evaluations(self) -> None:
+        """Wipe all pool evaluations for a fresh start."""
+        await self._execute("DELETE FROM pool_evaluations")
+        log.info("db_evaluations_wiped")
+
+    async def wipe_stale_evaluations(self, days: int = 7) -> None:
+        """Remove evaluations older than X days."""
+        await self._execute(
+            "DELETE FROM pool_evaluations WHERE ts < datetime('now', '-' || ? || ' days')",
+            (days,),
+        )
+        log.info("db_stale_evaluations_cleaned", days=days)
+
     # ── Alerts ────────────────────────────────────────────────────────────────
 
     async def insert_alert(

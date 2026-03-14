@@ -248,6 +248,12 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
     # ── Cog setup ─────────────────────────────────────────────────────────────
 
     async def cog_load(self) -> None:
+        db: Database = self.bot.state.get("db")
+        if db:
+            # Satisfy the "Fresh Start" requirement: clear previous eval data
+            await db.clear_all_evaluations()
+            log.info("defi_cog_wiped_old_data_for_fresh_start")
+
         scanner: PoolScanner = self.bot.state.get("pool_scanner")
         if scanner:
             scanner.discord_alert_callback  = self._send_migration_alert
