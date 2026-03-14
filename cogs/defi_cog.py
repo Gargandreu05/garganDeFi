@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from typing import Optional
 
 import aiohttp
 import discord
@@ -37,6 +38,7 @@ from defi_engine.quant_engine import QuantEngine
 from ui.database import Database
 from ui.graph_maker import GraphMaker
 from solana.rpc.async_api import AsyncClient
+from solders.pubkey import Pubkey
 
 log = structlog.get_logger(__name__)
 
@@ -470,6 +472,160 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
         )
         await self._execute_migration(candidate, ctx.channel)
 
+    @commands.command(name="withdraw_all")
+    async def withdraw_all(self, ctx: commands.Context) -> None:
+        """Emergency or manual full exit: swap all non-SOL tokens back to SOL. Owner only."""
+        if not self._is_owner(ctx.author):
+            await ctx.send("⛔ Only the bot owner can withdraw.")
+            return
+
+        await ctx.send("🔴 **Manual withdrawal initiated.** Swapping all tokens back to SOL…")
+        rpc = _rpc_client()
+        db: Database = self.bot.state.get("db")
+
+        try:
+            async with JupiterZap(rpc) as zap:
+                # Check SOL balance first
+                sol_balance = await zap.get_wallet_sol_balance()
+                await ctx.send(f"💰 Current SOL balance: `{sol_balance:.4f} SOL`")
+
+                # Get all token accounts with balance
+                from solana.rpc.types import TokenAccountOpts
+                token_accounts_resp = await rpc.get_token_accounts_by_owner(
+                    zap._keypair.pubkey(),
+                    TokenAccountOpts(program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")),
+                )
+                
+                token_accounts = token_accounts_resp.value
+                if not token_accounts:
+                    await ctx.send("ℹ️ No token accounts found. Wallet is already in SOL.")
+                    return
+
+                swapped_count = 0
+                for account in token_accounts:
+                    try:
+                        mint = str(account.account.data.parsed["info"]["mint"])
+                        amount_raw = int(account.account.data.parsed["info"]["tokenAmount"]["amount"])
+                        ui_amount = float(account.account.data.parsed["info"]["tokenAmount"]["uiAmount"] or 0)
+
+                        # Skip dust (less than $0.01 equivalent) and WSOL
+                        if amount_raw == 0 or mint == "So11111111111111111111111111111111111111112":
+                            continue
+                        if ui_amount < 0.01:
+                            continue
+
+                        await ctx.send(f"  🔀 Swapping `{ui_amount:.4f}` of `{mint[:20]}…` → SOL…")
+                        
+                        result = await zap.zap_token_to_sol(
+                            token_mint=mint,
+                            token_amount_raw=amount_raw,
+                        )
+                        
+                        if db:
+                            await db.insert_trade(
+                                trade_type="WITHDRAW",
+                                pool_id=os.getenv("ACTIVE_POOL_ID", ""),
+                                pool_name="Manual Withdrawal",
+                                amount_token=ui_amount,
+                                token_mint=mint,
+                                tx_signature=result["tx_signature"],
+                                status="CONFIRMED",
+                            )
+                        
+                        await ctx.send(
+                            f"  ✅ Swapped → `{result['sol_received']:.4f} SOL`\n"
+                            f"  TX: `{result['tx_signature'][:30]}…`"
+                        )
+                        swapped_count += 1
+
+                    except Exception as exc:
+                        log.error("withdraw_token_swap_failed", error=str(exc))
+                        await ctx.send(f"  ⚠️ Failed to swap token: `{exc}`")
+                        continue
+
+                final_sol = await zap.get_wallet_sol_balance()
+                if swapped_count == 0:
+                    await ctx.send("ℹ️ Nothing to withdraw — wallet already in SOL.")
+                else:
+                    await ctx.send(
+                        f"✅ **Withdrawal complete!**\n"
+                        f"Swapped `{swapped_count}` token(s) back to SOL.\n"
+                        f"Final balance: `{final_sol:.4f} SOL`"
+                    )
+
+        except Exception as exc:
+            log.critical("withdraw_all_failed", error=str(exc))
+            await ctx.send(f"💥 Withdrawal failed: `{exc}`")
+        finally:
+            await rpc.close()
+
+    @commands.command(name="invest_pool")
+    async def invest_pool(self, ctx: commands.Context, pool_id: str) -> None:
+        """
+        Manually invest into a specific pool by its DexScreener pair address.
+        Usage: !invest_pool <pair_address>
+        Example: !invest_pool GipgW6bsrDKaJkaYFPEkrQVfCqTexP4aP4aDTP4WEsN6
+        Owner only.
+        """
+        if not self._is_owner(ctx.author):
+            await ctx.send("⛔ Only the bot owner can manually invest.")
+            return
+
+        await ctx.send(f"🔍 Looking up pool `{pool_id[:20]}…`")
+
+        # Fetch pool data from DexScreener to validate it exists
+        scanner: PoolScanner = self.bot.state.get("pool_scanner")
+        pool_data = None
+        pool_name = "Unknown Pool"
+        try:
+            import aiohttp as _aiohttp
+            async with _aiohttp.ClientSession() as session:
+                url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pool_id}"
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        pairs = data.get("pairs", [])
+                        if pairs:
+                            p = pairs[0]
+                            base = p.get("baseToken", {}).get("symbol", "?")
+                            quote = p.get("quoteToken", {}).get("symbol", "?")
+                            pool_name = f"{base}/{quote}"
+                            liq = float(p.get("liquidity", {}).get("usd", 0) or 0)
+                            vol = float(p.get("volume", {}).get("h24", 0) or 0)
+                            pool_data = p
+                            await ctx.send(
+                                f"✅ Pool found: **{pool_name}**\n"
+                                f"💧 Liquidity: `${liq:,.0f}` | 📊 24h Vol: `${vol:,.0f}`\n"
+                                f"Proceeding with investment…"
+                            )
+        except Exception as exc:
+            await ctx.send(f"⚠️ Could not verify pool on DexScreener: `{exc}`\nProceeding anyway…")
+
+        # Determine quote mint — default to USDC
+        quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        if pool_data:
+            quote_token = pool_data.get("quoteToken", {})
+            quote_addr = quote_token.get("address", "")
+            if quote_addr and quote_addr != "So11111111111111111111111111111111111111112":
+                quote_mint = quote_addr
+
+        candidate = {
+            "pool_id": pool_id,
+            "name": pool_name,
+            "net_apy": 0.0,
+            "il_pct": 0.0,
+        }
+
+        # Update env so the bot tracks this as the active pool
+        from dotenv import set_key, find_dotenv
+        dotenv_path = find_dotenv(usecwd=True) or ".env"
+        set_key(dotenv_path, "ACTIVE_POOL_ID", pool_id)
+        set_key(dotenv_path, "ACTIVE_POOL_QUOTE_MINT", quote_mint)
+        os.environ["ACTIVE_POOL_ID"] = pool_id
+        os.environ["ACTIVE_POOL_QUOTE_MINT"] = quote_mint
+
+        await self._execute_migration(candidate, ctx.channel)
+
     # ── Migration execution ───────────────────────────────────────────────────
 
     async def _execute_migration(self, candidate: dict, channel: discord.abc.Messageable) -> None:
@@ -519,37 +675,97 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
             # Small pause for settlement
             await asyncio.sleep(5)
 
-            # ── Step 2: Jupiter Zap ────────────────────────────────────────
-            await channel.send("**[2/4]** 🔀 Swapping 50% SOL → Quote Token via Jupiter…")
+            # ── Step 2: Smart Jupiter Zap (only if needed) ────────────────────────
+            await channel.send("**[2/4]** 🔍 Checking wallet balances before swapping…")
             zap_result = None
             swap_trade_id = None
             try:
                 async with JupiterZap(rpc) as zap:
-                    if db:
-                        swap_trade_id = await db.insert_trade(
-                            trade_type="SWAP",
-                            pool_id=new_pool_id,
-                            pool_name=new_pool_name,
-                            status="PENDING",
+                    total_sol = await zap.get_wallet_sol_balance()
+
+                    # Check existing USDC/quote token balance
+                    existing_quote_raw = 0
+                    existing_quote_ui = 0.0
+                    try:
+                        from solana.rpc.types import TokenAccountOpts
+                        token_resp = await rpc.get_token_accounts_by_owner(
+                            zap._keypair.pubkey(),
+                            TokenAccountOpts(program_id=Pubkey.from_string(
+                                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                            )),
                         )
-                    zap_result = await zap.zap_sol_to_token(
-                        quote_mint=quote_mint,
-                        gas_reserve_sol=float(os.getenv("GAS_RESERVE_SOL", "0.02")),
+                        for acc in (token_resp.value or []):
+                            try:
+                                info = acc.account.data.parsed["info"]
+                                if info["mint"] == quote_mint:
+                                    existing_quote_raw = int(info["tokenAmount"]["amount"])
+                                    existing_quote_ui = float(info["tokenAmount"]["uiAmount"] or 0)
+                                    break
+                            except Exception:
+                                continue
+                    except Exception as exc:
+                        log.warning("balance_check_failed", error=str(exc))
+
+                    amounts = compute_zap_amounts(total_sol, float(os.getenv("GAS_RESERVE_SOL", "0.02")))
+                    sol_to_swap = amounts["sol_to_swap"]
+
+                    # Determine if we already have roughly 50/50 split
+                    # If existing quote covers >= 80% of what we'd swap, skip the swap
+                    sol_price_in_quote = existing_quote_ui  # USDC ≈ 1:1 with USD
+                    sol_value_usd = total_sol * 130  # rough estimate
+                    already_balanced = (
+                        existing_quote_raw > 0 and
+                        existing_quote_ui >= (sol_to_swap * 100)  # rough SOL→USD estimate
                     )
-                    if db and swap_trade_id:
-                        await db.update_trade_status(
-                            swap_trade_id, "CONFIRMED", zap_result["tx_signature"]
+
+                    if already_balanced:
+                        await channel.send(
+                            f"  ✅ Wallet already balanced!\n"
+                            f"  SOL: `{total_sol:.4f}` | Quote token: `{existing_quote_ui:.4f}`\n"
+                            f"  Skipping swap — proceeding directly to deposit."
                         )
-                    await channel.send(
-                        f"  ✅ Swap complete! SOL swapped: `{zap_result['sol_swapped']:.4f}`\n"
-                        f"  TX: `{zap_result['tx_signature'][:30]}…`"
-                    )
+                        # Build a synthetic zap_result using existing balances
+                        zap_result = {
+                            "tx_signature": "SKIPPED_ALREADY_BALANCED",
+                            "sol_swapped": 0.0,
+                            "sol_for_base": total_sol - float(os.getenv("GAS_RESERVE_SOL", "0.02")),
+                            "gas_reserve": float(os.getenv("GAS_RESERVE_SOL", "0.02")),
+                            "quote_mint": quote_mint,
+                            "out_amount_raw": existing_quote_raw,
+                        }
+                    else:
+                        await channel.send(
+                            f"  💱 Swapping `{sol_to_swap:.4f}` SOL → Quote Token via Jupiter…\n"
+                            f"  (Current quote balance: `{existing_quote_ui:.4f}`)"
+                        )
+                        if db:
+                            swap_trade_id = await db.insert_trade(
+                                trade_type="SWAP",
+                                pool_id=new_pool_id,
+                                pool_name=new_pool_name,
+                                status="PENDING",
+                            )
+                        zap_result = await zap.zap_sol_to_token(
+                            quote_mint=quote_mint,
+                            gas_reserve_sol=float(os.getenv("GAS_RESERVE_SOL", "0.02")),
+                        )
+                        if db and swap_trade_id:
+                            await db.update_trade_status(
+                                swap_trade_id, "CONFIRMED", zap_result["tx_signature"]
+                            )
+                        await channel.send(
+                            f"  ✅ Swap complete! SOL swapped: `{zap_result['sol_swapped']:.4f}`\n"
+                            f"  TX: `{zap_result['tx_signature'][:30]}…`"
+                        )
+
             except Exception as exc:
                 log.error("migration_zap_failed", error=str(exc))
                 if db and swap_trade_id:
                     await db.update_trade_status(swap_trade_id, "FAILED")
-                await channel.send(f"  ❌ Swap failed: `{exc}`")
-                await channel.send("❌ **Migration aborted at swap step.** Funds remain as SOL in wallet.")
+                await channel.send(
+                    f"  ❌ Swap failed: `{exc}`\n"
+                    f"  ⚠️ If you already have tokens in your wallet, use `!invest_pool <pool_id>` to deposit manually."
+                )
                 return
 
             await asyncio.sleep(5)
@@ -644,7 +860,7 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
 
     async def _send_migration_alert(
         self,
-        current: dict,
+        current: Optional[dict],
         candidate: dict,
         reason: str,
     ) -> None:
@@ -654,59 +870,77 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
             log.warning("private_defi_channel_not_found", channel_id=self._private_defi_channel_id)
             return
 
-        rpc = _rpc_client()
-        expected_slippage = "0.5%"
-        price_impact = "Simulation Failed"
-        gas_fee = "0.00 SOL"
-        net_gain = f"+{candidate['net_apy'] - current['net_apy']:.2f}% APY"
+        # Data extraction
+        liquidity = candidate.get("liquidity", 0)
+        il_pct = candidate.get("il_pct", 0)
+        vol_24h = candidate.get("vol_24h", 0)
+        risk_reward = candidate.get("risk_reward", 0)
         
-        try:
-            async with JupiterZap(rpc) as zap:
-                total_sol = await zap.get_wallet_sol_balance()
-                amounts = compute_zap_amounts(total_sol, gas_reserve_sol=0.02)
-                if amounts["sol_to_swap"] > 0:
-                    swap_lamports = int(amounts["sol_to_swap"] * LAMPORTS_PER_SOL)
-                    target_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # default usdc
-                    if candidate.get("base") and candidate.get("base") != "So11111111111111111111111111111111111111112":
-                        target_mint = candidate["base"]
-                    elif candidate.get("quote") and candidate.get("quote") != "So11111111111111111111111111111111111111112":
-                        target_mint = candidate["quote"]
+        # Calculations
+        safety_score = min(100, int((liquidity / 1_000_000) * 30 + (100 - min(il_pct * 5, 50)) + 20))
+        vol_liq_ratio = (vol_24h / liquidity * 100) if liquidity > 0 else 0.0
 
-                    url = "https://quote-api.jup.ag/v6/quote"
-                    params = {
-                        "inputMint": "So11111111111111111111111111111111111111112",
-                        "outputMint": target_mint,
-                        "amount": str(swap_lamports),
-                        "slippageBps": "50"
-                    }
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, params=params) as resp:
-                            if resp.status == 200:
-                                quote_data = await resp.json()
-                                p_impact = quote_data.get("priceImpactPct", 0)
-                                price_impact = f"{float(p_impact) * 100:.3f}%"
-                                expected_slippage = "0.5%"
-                                route = quote_data.get("routePlan", [])
-                                if route:
-                                    f_amt = route[0].get("swapInfo", {}).get("feeAmount", "0")
-                                    gas_fee = f"{int(f_amt) / LAMPORTS_PER_SOL:.6f} SOL"
-        except Exception as exc:
-            log.error("simulation_failed", error=str(exc))
-        finally:
-            await rpc.close()
+        # Safety Label
+        if safety_score >= 80:
+            safety_label = "🟢 Excellent"
+        elif safety_score >= 60:
+            safety_label = "🟡 Good"
+        elif safety_score >= 40:
+            safety_label = "🟠 Caution"
+        else:
+            safety_label = "🔴 Risky"
 
-        owner_mention = f"<@{self._owner_id}>" if self._owner_id else "Owner"
+        # Risk/Reward Interpretation
+        if risk_reward >= 100:
+            rr_interpretation = "🔥 Exceptional — very high yield vs very low IL risk"
+        elif risk_reward >= 50:
+            rr_interpretation = "✅ Strong — good yield/risk balance"
+        elif risk_reward >= 20:
+            rr_interpretation = "⚠️ Moderate — acceptable but monitor IL"
+        else:
+            rr_interpretation = "🔴 Weak — high IL risk vs yield"
+
+        title = "🚀 New Investment Opportunity" if current is None else "🔄 Pool Migration Alert"
+        color = discord.Color.green() if safety_score >= 70 else discord.Color.gold()
+        if "alert" in reason.lower() or "dropped" in reason.lower():
+            color = discord.Color.red()
+
         embed = discord.Embed(
-            title="🔔 Pool Migration Proposal",
-            description=f"{owner_mention} — a better pool has been discovered!\n\n**Reason:** {reason}",
-            color=discord.Color.red() if "alert" in reason.lower() else discord.Color.blue(),
+            title=title,
+            description=f"**Reason:** {reason}",
+            color=color,
         )
-        embed.add_field(name="Current APY", value=f"`{current['net_apy']:.2f}%`", inline=True)
-        embed.add_field(name="Target APY", value=f"`{candidate['net_apy']:.2f}%`", inline=True)
-        embed.add_field(name="Net Gain", value=f"`{net_gain}`", inline=True)
-        embed.add_field(name="Expected Slippage", value=f"`{expected_slippage}`", inline=True)
-        embed.add_field(name="Price Impact (Jupiter)", value=f"`{price_impact}`", inline=True)
-        embed.add_field(name="Estimated Gas Fee", value=f"`{gas_fee}`", inline=True)
+        embed.add_field(name="Pool", value=f"**{candidate['name']}**", inline=False)
+        
+        # Detailed Safety Score Breakdown
+        embed.add_field(
+            name="🛡️ Safety Score",
+            value=(
+                f"{safety_label} ({safety_score}/100)\n"
+                f"💧 Liquidity: ${liquidity:,.0f}\n"
+                f"📉 IL Risk: {il_pct:.2f}%\n"
+                f"📊 Vol/Liq ratio: {vol_liq_ratio:.2f}%"
+            ),
+            inline=True
+        )
+
+        # Detailed Risk/Reward
+        embed.add_field(
+            name="⚖️ Risk/Reward",
+            value=(
+                f"Score: {risk_reward:.2f} (higher = better, avg blue-chip ~50)\n"
+                f"{rr_interpretation}"
+            ),
+            inline=True
+        )
+
+        if current:
+            net_gain = candidate['net_apy'] - current['net_apy']
+            comparison = f"Current: {current['net_apy']:.2f}% → New: {candidate['net_apy']:.2f}% (+{net_gain:.2f}%)"
+            embed.add_field(name="APY Comparison", value=comparison, inline=False)
+        else:
+            embed.add_field(name="Net APY", value=f"{candidate['net_apy']:.2f}%", inline=False)
+
         embed.set_footer(text="GarganDeFi | Click Approve to migrate")
 
         view = _MigrationView(cog=self, candidate=candidate)

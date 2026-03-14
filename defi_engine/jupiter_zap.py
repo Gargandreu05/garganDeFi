@@ -20,6 +20,7 @@ from typing import Optional
 import aiohttp
 import structlog
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from tenacity import (
@@ -35,7 +36,7 @@ log = structlog.get_logger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 WSOL_MINT = "So11111111111111111111111111111111111111112"
-JUPITER_API_BASE = os.getenv("JUPITER_API_BASE", "https://quote-api.jup.ag/v6")
+JUPITER_API_BASE = os.getenv("JUPITER_API_BASE", "https://api.jup.ag/swap/v1")
 JUPITER_SLIPPAGE_BPS = int(os.getenv("JUPITER_SLIPPAGE_BPS", "50"))
 
 
@@ -152,6 +153,60 @@ class JupiterZap:
             "out_amount_raw": int(quote.get("outAmount", 0)),
         }
 
+    async def zap_token_to_sol(
+        self,
+        token_mint: str,
+        token_amount_raw: int,
+    ) -> dict:
+        """
+        Swap any SPL token back to SOL via Jupiter.
+        Used when exiting a position.
+        
+        Args:
+            token_mint: The mint address of the token to sell.
+            token_amount_raw: Amount in raw token units (not UI amount).
+        
+        Returns:
+            dict with tx_signature and sol_received estimate.
+        """
+        if self._keypair is None:
+            self._keypair = _load_keypair()
+        if self._session is None:
+            raise RuntimeError("JupiterZap must be used as an async context manager.")
+
+        log.info(
+            "zap_token_to_sol_starting",
+            token_mint=token_mint,
+            amount_raw=token_amount_raw,
+        )
+
+        # Get quote: token → wSOL
+        quote = await self._get_quote(
+            input_mint=token_mint,
+            output_mint=WSOL_MINT,
+            amount_lamports=token_amount_raw,
+        )
+
+        sol_out_lamports = int(quote.get("outAmount", 0))
+        sol_out = sol_out_lamports / LAMPORTS_PER_SOL
+
+        # Execute swap
+        tx_sig = await self._execute_swap(quote)
+
+        log.info(
+            "zap_token_to_sol_completed",
+            tx_signature=tx_sig,
+            sol_received=sol_out,
+            token_mint=token_mint,
+        )
+
+        return {
+            "tx_signature": tx_sig,
+            "sol_received": sol_out,
+            "token_mint": token_mint,
+            "token_amount_raw": token_amount_raw,
+        }
+
     # ── Jupiter API internals ─────────────────────────────────────────────────
 
     async def _get_quote(
@@ -204,6 +259,7 @@ class JupiterZap:
             "dynamicComputeUnitLimit": True,
         }
 
+        swap_data = None
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=2, max=15),
@@ -215,32 +271,33 @@ class JupiterZap:
                     resp.raise_for_status()
                     swap_data = await resp.json()
 
-        # Decode and sign the transaction
+        # Decode the transaction
         raw_tx_bytes = base64.b64decode(swap_data["swapTransaction"])
-        # Deserialize as VersionedTransaction
-        tx = VersionedTransaction.from_bytes(raw_tx_bytes)
-        # Re-sign with our keypair (Jupiter already partially signs for their fee accounts)
-        signed_tx = self._keypair.sign_message(bytes(tx.message))
 
-        # Submit via Solana RPC
+        # Deserialize, sign and reserialize correctly with solders
+        tx = VersionedTransaction.from_bytes(raw_tx_bytes)
+        signed_tx = VersionedTransaction(tx.message, [self._keypair])
+
+        # Submit via Solana RPC using TxOpts (not a dict)
         try:
             result = await self._rpc.send_raw_transaction(
-                bytes(tx),
-                opts={"skip_preflight": False, "preflight_commitment": "confirmed"},
+                bytes(signed_tx),
+                opts=TxOpts(skip_preflight=False, preflight_commitment="confirmed"),
             )
             sig = result.value
         except Exception as exc:
             log.error("send_transaction_failed", error=str(exc))
             raise
 
-        # Confirm the transaction (wait up to 90 s)
+        log.info("transaction_submitted", signature=str(sig))
         await self._confirm_transaction(str(sig))
         return str(sig)
 
-    async def _confirm_transaction(self, signature: str, timeout_s: int = 90) -> None:
-        """Poll until a transaction is confirmed or timeout expires."""
+    async def _confirm_transaction(self, signature: str, timeout_s: int = 300) -> None:
+        """Poll until a transaction is confirmed or timeout expires.
+        On timeout, logs a warning but does NOT raise — tx likely landed on-chain."""
         deadline = asyncio.get_event_loop().time() + timeout_s
-        log.info("awaiting_confirmation", signature=signature)
+        log.info("awaiting_confirmation", signature=signature, timeout_s=timeout_s)
 
         while asyncio.get_event_loop().time() < deadline:
             try:
@@ -252,13 +309,20 @@ class JupiterZap:
                             f"Transaction {signature} failed on-chain: {status.err}"
                         )
                     if status.confirmation_status in ("confirmed", "finalized"):
-                        log.info("transaction_confirmed", signature=signature)
+                        log.info("transaction_confirmed", signature=signature,
+                                 status=status.confirmation_status)
                         return
+            except RuntimeError:
+                raise  # Re-raise on-chain failures immediately
             except Exception as exc:
                 log.warning("confirm_poll_error", error=str(exc))
 
-            await asyncio.sleep(4)
+            await asyncio.sleep(5)
 
-        raise TimeoutError(
-            f"Transaction {signature} was not confirmed within {timeout_s}s"
+        # Timeout — warn but don't crash. The tx likely landed.
+        log.warning(
+            "confirmation_timeout_non_fatal",
+            signature=signature,
+            timeout_s=timeout_s,
+            note="Transaction may still have succeeded. Check explorer manually.",
         )

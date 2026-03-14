@@ -140,6 +140,7 @@ class PoolScanner:
             "net_apy": net["net_apy_pct"], "il_pct": net["il_pct"],
             "raw_apy": data.get("apy", 0), "db_id": db_id,
             "liquidity": data.get("liquidity", 0),
+            "vol_24h": data.get("vol_24h", 0),
             "risk_reward": risk_reward
         }
 
@@ -188,83 +189,155 @@ class PoolScanner:
         return discovered
 
     async def _fetch_pool_data(self, pool_id: str) -> Optional[dict]:
+        """Fetch pool data from DexScreener. Tries direct pair lookup first, then search fallback."""
         url = f"{DEXSCREENER_API_BASE}/pairs/solana/{pool_id}"
         try:
             async with self._session.get(url) as resp:
                 if resp.status == 200:
-                    pair = (await resp.json()).get("pairs", [{}])[0]
-                    if not pair: return None
-                    return {
-                        "apy": float(pair.get("apr", 0) or 0),
-                        "fee7d": float(pair.get("volume", {}).get("h24", 0)) * 0.0025 * 7,
-                        "liquidity": float(pair.get("liquidity", {}).get("usd", 0)),
-                        "price": float(pair.get("priceUsd", 0)),
-                        "vol_24h": float(pair.get("volume", {}).get("h24", 0)),
-                        "created_at": pair.get("pairCreatedAt", 0),
-                        "rugged": any(l.get("label") == "rugged" for l in pair.get("labels", []))
-                    }
-        except Exception: pass
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    if pairs:
+                        return self._normalize_pair(pairs[0])
+        except Exception as exc:
+            log.debug("direct_pair_fetch_failed", pool_id=pool_id, error=str(exc))
+
+        # Fallback: search by pool_id as query (resolves Raydium AMM IDs via DexScreener search)
+        search_url = f"{DEXSCREENER_API_BASE}/search/?q={pool_id}"
+        try:
+            async with self._session.get(search_url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs", [])
+                    solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+                    if solana_pairs:
+                        return self._normalize_pair(solana_pairs[0])
+        except Exception as exc:
+            log.debug("search_pair_fetch_failed", pool_id=pool_id, error=str(exc))
+
         return None
 
+    def _normalize_pair(self, pair: dict) -> dict:
+        """Normalize a DexScreener pair response into the internal pool data format."""
+        if not isinstance(pair, dict):
+            log.warning("normalize_pair_not_a_dict", received=type(pair).__name__)
+            return {}
+
+        log.debug("normalize_pair_raw", pair_keys=list(pair.keys()))
+
+        def safe_float(val) -> float:
+            try:
+                return float(val) if val is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        def safe_dict(val) -> dict:
+            return val if isinstance(val, dict) else {}
+
+        liquidity  = safe_float(safe_dict(pair.get("liquidity")).get("usd"))
+        vol_24h    = safe_float(safe_dict(pair.get("volume")).get("h24"))
+        price      = safe_float(pair.get("priceUsd"))
+        base_token = safe_dict(pair.get("baseToken"))
+        quote_token = safe_dict(pair.get("quoteToken"))
+
+        fee7d = vol_24h * 0.0025 * 7
+        apy   = (fee7d * 52 / liquidity * 100) if liquidity > 0 else 0.0
+
+        labels = pair.get("labels", [])
+        if not isinstance(labels, list):
+            labels = []
+
+        return {
+            "apy":       round(apy, 4),
+            "fee7d":     round(fee7d, 2),
+            "liquidity": liquidity,
+            "price":     price,
+            "vol_24h":   vol_24h,
+            "created_at": pair.get("pairCreatedAt", 0),
+            "rugged":    any(
+                safe_dict(l).get("label") == "rugged" for l in labels
+            ),
+            "pair_name": f"{base_token.get('symbol', '?')}/{quote_token.get('symbol', '?')}",
+        }
+
     async def _get_sol_price(self) -> float:
-        url = "https://price.jup.ag/v4/price?ids=SOL"
+        url = "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112"
         try:
             async with self._session.get(url) as resp:
-                data = await resp.json()
-                return float(data["data"]["SOL"]["price"])
-        except Exception: return 150.0
+                if resp.status == 200:
+                    data = await resp.json()
+                    return float(
+                        data["data"]["So11111111111111111111111111111111111111112"]["price"]
+                    )
+        except Exception as exc:
+            log.warning("sol_price_fetch_failed", error=str(exc))
+        return 150.0
 
     async def _check_and_alert(self, active_id: str, results: List[Dict]) -> None:
-        """
-        Evaluate candidates and send alerts.
-        Now alerts for top 3 risk-to-reward pools and relaxes confluence for Blue-Chips.
-        """
-        if not results: return
-        
-        # Sort by Risk-to-Reward to find Top 3 "Blue-Chip" candidates
+        if not results:
+            return
+
         candidates = sorted(results, key=lambda x: x.get("risk_reward", 0), reverse=True)[:3]
-        
+
+        # Always log top 3 so they appear in terminal output
+        for i, c in enumerate(candidates):
+            log.info(
+                "top_pool_recommendation",
+                rank=i + 1,
+                name=c["name"],
+                net_apy=round(c["net_apy"], 2),
+                il_pct=round(c["il_pct"], 2),
+                risk_reward=round(c["risk_reward"], 2),
+                liquidity=round(c.get("liquidity", 0)),
+            )
+
         current = next((r for r in results if r["pool_id"] == active_id), None)
-        if not current: return
+
+        # If no active pool is configured, recommend the best one directly
+        if not current:
+            best = candidates[0]
+            log.info("no_active_pool_recommending_best", pool=best["name"])
+            if self.discord_alert_callback:
+                await self.discord_alert_callback(
+                    current=None,
+                    candidate=best,
+                    reason=(
+                        f"🚀 No active pool configured. "
+                        f"**Best opportunity found:** {best['name']} | "
+                        f"Net APY: {best['net_apy']:.2f}% | "
+                        f"Liquidity: ${best.get('liquidity', 0):,.0f} | "
+                        f"Risk/Reward score: {best['risk_reward']:.2f}"
+                    ),
+                )
+            return
 
         for cand in candidates:
-            # 1. Skip if already in this pool
-            if cand["pool_id"] == active_id: continue
+            if cand["pool_id"] == active_id:
+                continue
 
-            # 2. Check Migration Profitability
             profitable, reason = is_migration_profitable(
                 current["net_apy"], cand["net_apy"], self._min_improvement, self._max_il, cand["il_pct"]
             )
-            
-            # 3. Technical Confluence (Relaxed if TVL > $1M)
-            is_huge = cand.get("liquidity", 0) > 1000000
-            quant_result = await self._quant.analyze_crypto(cand["pool_id"], relaxed=is_huge)
-            
-            confluence_pass = quant_result is not None
-            
-            # THE RELAXATION RULE: 
-            # If the pool is huge, we lower the bar to ensure the user sees the analysis.
-            if not confluence_pass and not is_huge:
-                log.info("candidate_failed_confluence", pool=cand["name"], liquidity=cand.get("liquidity"))
-                continue
-            elif not confluence_pass and is_huge:
-                log.info("blue_chip_low_confluence_but_showing", pool=cand["name"])
 
-            # 4. Alert / Propose
+            is_huge = cand.get("liquidity", 0) > 1_000_000
+            quant_result = await self._quant.analyze_crypto(cand["pool_id"], relaxed=is_huge)
+            confluence_pass = quant_result is not None
+
+            if not confluence_pass and not is_huge:
+                log.info("candidate_failed_confluence", pool=cand["name"])
+                continue
+
             if profitable or (is_huge and cand["net_apy"] > current["net_apy"] * 0.9):
                 final_reason = reason
                 if is_huge:
-                    final_reason += " | 🐋 BLUE-CHIP (> $1M)"
+                    final_reason += " | 🐋 BLUE-CHIP (> $1M TVL)"
                 if quant_result:
-                    final_reason += f" | Technical Confidence: {quant_result['confidence_score']}%"
+                    final_reason += f" | Confidence: {quant_result['confidence_score']:.1f}%"
 
-                # Only set the absolute best as the "pending" one for buttons/auto
                 if cand == candidates[0] and profitable:
                     self._pending_migration = cand
                     if self._autonomous and self.migration_callback:
                         await self.migration_callback(cand)
-                
-                # Alert for all interesting high-liquidity detections
+
                 if self.discord_alert_callback:
                     await self.discord_alert_callback(current, cand, final_reason)
 
