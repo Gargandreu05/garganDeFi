@@ -46,7 +46,7 @@ ATA_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bX
 # System Program
 SYSTEM_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
 
-RAYDIUM_POOL_ACCOUNTS_URL = "https://api.raydium.io/v2/ammV3/ammPool"
+RAYDIUM_POOL_ACCOUNTS_URL = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json"
 
 
 def _load_keypair() -> Keypair:
@@ -190,8 +190,7 @@ class RaydiumExecutor:
     # ── Internals: Pool Data ──────────────────────────────────────────────────
 
     async def _fetch_pool_accounts(self, pool_id: str) -> Optional[dict]:
-        """Fetch full pool account addresses from Raydium API."""
-        url = f"{RAYDIUM_POOL_ACCOUNTS_URL}/{pool_id}"
+        """Fetch full pool account addresses from Raydium SDK mainnet list."""
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(4),
@@ -200,9 +199,17 @@ class RaydiumExecutor:
                 reraise=True,
             ):
                 with attempt:
-                    async with self._session.get(url) as resp:
+                    async with self._session.get(RAYDIUM_POOL_ACCOUNTS_URL) as resp:
                         resp.raise_for_status()
-                        return await resp.json()
+                        data = await resp.json()
+                        
+                        # Search in official and unOfficial lists
+                        for pool in data.get("official", []) + data.get("unOfficial", []):
+                            if pool.get("id") == pool_id:
+                                return pool
+                        
+                        log.warning("pool_not_found_in_sdk_list", pool_id=pool_id)
+                        return None
         except Exception as exc:
             log.error("fetch_pool_accounts_failed", pool_id=pool_id, error=str(exc))
             return None

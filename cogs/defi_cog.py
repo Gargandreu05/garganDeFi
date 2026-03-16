@@ -493,7 +493,10 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
                 from solana.rpc.types import TokenAccountOpts
                 token_accounts_resp = await rpc.get_token_accounts_by_owner(
                     zap._keypair.pubkey(),
-                    TokenAccountOpts(program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")),
+                    TokenAccountOpts(
+                        program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+                        encoding="jsonParsed"
+                    ),
                 )
                 
                 token_accounts = token_accounts_resp.value
@@ -502,6 +505,7 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
                     return
 
                 swapped_count = 0
+                failed_count = 0
                 for account in token_accounts:
                     try:
                         mint = str(account.account.data.parsed["info"]["mint"])
@@ -541,11 +545,17 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
                     except Exception as exc:
                         log.error("withdraw_token_swap_failed", error=str(exc))
                         await ctx.send(f"  ⚠️ Failed to swap token: `{exc}`")
+                        failed_count += 1
                         continue
 
                 final_sol = await zap.get_wallet_sol_balance()
-                if swapped_count == 0:
+                if swapped_count == 0 and failed_count == 0:
                     await ctx.send("ℹ️ Nothing to withdraw — wallet already in SOL.")
+                elif swapped_count == 0 and failed_count > 0:
+                    await ctx.send(
+                        f"⚠️ **Withdrawal incomplete** — {failed_count} token(s) failed to swap. "
+                        f"Check logs and retry `!withdraw_all`."
+                    )
                 else:
                     await ctx.send(
                         f"✅ **Withdrawal complete!**\n"
@@ -683,6 +693,19 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
                 async with JupiterZap(rpc) as zap:
                     total_sol = await zap.get_wallet_sol_balance()
 
+                    # BUG 3 FIX: check MIN_INVEST_SOL
+                    gas_reserve = float(os.getenv("GAS_RESERVE_SOL", "0.02"))
+                    deployable = total_sol - gas_reserve
+                    min_invest = float(os.getenv("MIN_INVEST_SOL", "0.05"))
+
+                    if deployable < min_invest:
+                        await channel.send(
+                            f"❌ **Migration aborted**: Deployable balance (`{deployable:.4f} SOL`) is "
+                            f"below the minimum investment threshold (`{min_invest:.2f} SOL`).\n"
+                            f"Please add more SOL to your wallet and try again."
+                        )
+                        return
+
                     # Check existing USDC/quote token balance
                     existing_quote_raw = 0
                     existing_quote_ui = 0.0
@@ -690,9 +713,10 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
                         from solana.rpc.types import TokenAccountOpts
                         token_resp = await rpc.get_token_accounts_by_owner(
                             zap._keypair.pubkey(),
-                            TokenAccountOpts(program_id=Pubkey.from_string(
-                                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-                            )),
+                            TokenAccountOpts(
+                                program_id=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+                                encoding="jsonParsed"
+                            ),
                         )
                         for acc in (token_resp.value or []):
                             try:
@@ -706,17 +730,28 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
                     except Exception as exc:
                         log.warning("balance_check_failed", error=str(exc))
 
-                    amounts = compute_zap_amounts(total_sol, float(os.getenv("GAS_RESERVE_SOL", "0.02")))
+                    amounts = compute_zap_amounts(total_sol, gas_reserve)
                     sol_to_swap = amounts["sol_to_swap"]
 
-                    # Determine if we already have roughly 50/50 split
-                    # If existing quote covers >= 80% of what we'd swap, skip the swap
-                    sol_price_in_quote = existing_quote_ui  # USDC ≈ 1:1 with USD
-                    sol_value_usd = total_sol * 130  # rough estimate
-                    already_balanced = (
-                        existing_quote_raw > 0 and
-                        existing_quote_ui >= (sol_to_swap * 100)  # rough SOL→USD estimate
-                    )
+                    # BUG 2 FIX: Real Jupiter quote for SOL/Quote price (Skip hardcoded estimate)
+                    already_balanced = False
+                    try:
+                        price_quote = await zap._get_quote(
+                            input_mint="So11111111111111111111111111111111111111112",
+                            output_mint=quote_mint,
+                            amount_lamports=LAMPORTS_PER_SOL  # 1 SOL
+                        )
+                        real_sol_price_raw = float(price_quote["outAmount"])
+                        target_quote_raw = sol_to_swap * real_sol_price_raw
+                        
+                        # If existing quote covers >= 80% of what we'd swap, skip the swap
+                        already_balanced = (
+                            existing_quote_raw > 0 and
+                            existing_quote_raw >= (target_quote_raw * 0.8)
+                        )
+                    except Exception as exc:
+                        log.warning("real_price_fetch_failed", error=str(exc))
+                        already_balanced = False
 
                     if already_balanced:
                         await channel.send(
@@ -728,8 +763,8 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
                         zap_result = {
                             "tx_signature": "SKIPPED_ALREADY_BALANCED",
                             "sol_swapped": 0.0,
-                            "sol_for_base": total_sol - float(os.getenv("GAS_RESERVE_SOL", "0.02")),
-                            "gas_reserve": float(os.getenv("GAS_RESERVE_SOL", "0.02")),
+                            "sol_for_base": amounts["sol_for_base"],
+                            "gas_reserve": gas_reserve,
                             "quote_mint": quote_mint,
                             "out_amount_raw": existing_quote_raw,
                         }
@@ -747,7 +782,7 @@ class DeFiCog(commands.Cog, name="DeFi Engine"):
                             )
                         zap_result = await zap.zap_sol_to_token(
                             quote_mint=quote_mint,
-                            gas_reserve_sol=float(os.getenv("GAS_RESERVE_SOL", "0.02")),
+                            gas_reserve_sol=gas_reserve,
                         )
                         if db and swap_trade_id:
                             await db.update_trade_status(

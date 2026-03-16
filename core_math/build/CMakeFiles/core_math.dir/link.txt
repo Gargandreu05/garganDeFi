@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -flto -shared  -o core_math.cpython-313-x86_64-linux-gnu.so CMakeFiles/core_math.dir/core_math.cpp.o 

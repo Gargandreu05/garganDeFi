@@ -23,9 +23,16 @@ from dotenv import load_dotenv
 import structlog
 
 from ui.database import Database
-from defi_engine.pool_scanner import PoolScanner
-from crawlers.motor import DealsCrawler
 from config.system_monitor import SystemMonitor
+
+# ── Multi-Agent System Imports ──────────────────────────────────────────────────
+from agents.market_agent import MarketAgent
+from agents.scanner_agent import ScannerAgent
+from agents.risk_agent import RiskAgent
+from agents.execution_agent import ExecutionAgent
+from agents.discord_agent import DiscordAgent
+from agents.coordinator import Coordinator
+from agents.news_agent import NewsAgent
 
 # ── Load .env ──────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -114,20 +121,6 @@ async def on_command_error(ctx: commands.Context, error: Exception) -> None:
 #  Startup / teardown
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def _load_cogs() -> None:
-    cog_modules = [
-        # "cogs.deals_cog",
-        "cogs.defi_cog",
-    ]
-    for module in cog_modules:
-        try:
-            await bot.load_extension(module)
-            log.info("cog_loaded", module=module)
-        except Exception as exc:
-            log.error("cog_load_failed", module=module, error=str(exc))
-            raise
-
-
 async def main() -> None:
     # 1. Initialise DB
     db_path = os.getenv("DB_PATH", "./data/gargandefi.db")
@@ -136,19 +129,34 @@ async def main() -> None:
     await db.initialise()
     log.info("database_ready", path=db_path)
 
-    # 2. Initialise shared services
-    scanner = PoolScanner(db=db)
-    # crawler = DealsCrawler(db=db)
+    # 2. Initialise Agents
+    market_agent = MarketAgent()
+    scanner_agent = ScannerAgent(market_agent=market_agent, db=db)
+    risk_agent = RiskAgent(market_agent=market_agent)
+    execution_agent = ExecutionAgent(db=db)
+    discord_agent = DiscordAgent(bot=bot)
+    
+    coordinator = Coordinator(
+        market=market_agent, 
+        scanner=scanner_agent, 
+        risk=risk_agent,
+        executor=execution_agent, 
+        discord=discord_agent, 
+        db=db
+    )
+    
+    news_agent = NewsAgent(discord_agent=discord_agent)
+    
+    discord_agent.set_coordinator(coordinator)
     monitor = SystemMonitor(bot=bot)
 
-    # Store on bot so Cogs can access via ctx.bot.state
+    # Store on bot so standard access patterns still work for monitor/DB if needed
     bot.state["db"] = db
-    bot.state["pool_scanner"] = scanner
-    # bot.state["deals_crawler"] = crawler
     bot.state["system_monitor"] = monitor
 
-    # 3. Load Cogs
-    await _load_cogs()
+    # 3. Load Discord Cog
+    await bot.add_cog(discord_agent)
+    log.info("discord_agent_cog_loaded")
 
     # 4. Graceful shutdown handler
     loop = asyncio.get_running_loop()
@@ -169,8 +177,8 @@ async def main() -> None:
 
     async with bot:
         background_tasks = [
-            asyncio.create_task(scanner.run_forever(), name="pool_scanner"),
-            # asyncio.create_task(crawler.run_forever(), name="deals_crawler"),
+            asyncio.create_task(coordinator.run_forever(), name="coordinator_loop"),
+            asyncio.create_task(news_agent.run_forever(), name="news_loop"),
             asyncio.create_task(bot.start(token), name="discord_bot"),
             asyncio.create_task(shutdown_event.wait(), name="shutdown_watcher"),
         ]
@@ -193,6 +201,7 @@ async def main() -> None:
         await db.close()
         # Ensure monitor loops are closed
         monitor.stop()
+        await market_agent.close()  # Close session
         log.info("shutdown_complete")
 
 
